@@ -67,6 +67,19 @@ async def run_input_guardrails_with_queue(
         asyncio.create_task(run_single_input_guardrail(agent, guardrail, input, context))
         for guardrail in guardrails
     ]
+
+    def record_completed_siblings() -> None:
+        # A sibling that already finished successfully before the tripwire is handled belongs
+        # in the reported results, even though the completion loop has not consumed it yet.
+        recorded = {id(existing) for existing in streamed_result.input_guardrail_results}
+        for task in guardrail_tasks:
+            if task.done() and not task.cancelled() and task.exception() is None:
+                sibling = task.result()
+                if id(sibling) not in recorded:
+                    streamed_result.input_guardrail_results = (
+                        streamed_result.input_guardrail_results + [sibling]
+                    )
+
     try:
         for done in asyncio.as_completed(guardrail_tasks):
             result = await done
@@ -77,6 +90,7 @@ async def run_input_guardrails_with_queue(
                 result
             ]
             if result.output.tripwire_triggered:
+                record_completed_siblings()
                 streamed_result._triggered_input_guardrail_result = result
                 queue.put_nowait(result)
                 for t in guardrail_tasks:
@@ -141,11 +155,22 @@ async def run_input_guardrails(
         if results_sink is not None:
             results_sink.append(result)
 
+    def record_completed_siblings() -> None:
+        # A sibling that already finished successfully before the tripwire is handled belongs
+        # in the reported results, even though the completion loop has not consumed it yet.
+        recorded = {id(existing) for existing in guardrail_results}
+        for task in guardrail_tasks:
+            if task.done() and not task.cancelled() and task.exception() is None:
+                sibling = task.result()
+                if id(sibling) not in recorded:
+                    record(sibling)
+
     try:
         for done in asyncio.as_completed(guardrail_tasks):
             result = await done
             if result.output.tripwire_triggered:
                 record(result)
+                record_completed_siblings()
                 for t in guardrail_tasks:
                     t.cancel()
                 await asyncio.gather(*guardrail_tasks, return_exceptions=True)
@@ -197,11 +222,22 @@ async def run_output_guardrails(
         if results_sink is not None:
             results_sink.append(result)
 
+    def record_completed_siblings() -> None:
+        # A sibling that already finished successfully before the tripwire is handled belongs
+        # in the reported results, even though the completion loop has not consumed it yet.
+        recorded = {id(existing) for existing in guardrail_results}
+        for task in guardrail_tasks:
+            if task.done() and not task.cancelled() and task.exception() is None:
+                sibling = task.result()
+                if id(sibling) not in recorded:
+                    record(sibling)
+
     try:
         for done in asyncio.as_completed(guardrail_tasks):
             result = await done
             if result.output.tripwire_triggered:
                 record(result)
+                record_completed_siblings()
                 for t in guardrail_tasks:
                     t.cancel()
                 await asyncio.gather(*guardrail_tasks, return_exceptions=True)
