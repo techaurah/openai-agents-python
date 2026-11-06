@@ -421,6 +421,33 @@ def reconcile_nested_history_owned_session_item_refs(
     return retained_refs + [item_ref for item_ref in new_refs if item_ref not in retained_set]
 
 
+def _align_limited_history_window(
+    history: list[TResponseInputItem], limit: int
+) -> list[TResponseInputItem]:
+    """Align a limited history window so it does not start inside a model response.
+
+    The caller fetches one lookback item beyond ``limit``. If that item is a reasoning item
+    and the window would otherwise start with an output item from the same response (an
+    assistant message or a function call), the Responses API rejects that item for missing
+    its required reasoning item, so the reasoning item stays in the window. In every other
+    case the lookback item is dropped and the window keeps exactly ``limit`` items.
+    """
+    if len(history) <= limit:
+        return history
+    lookback_item, window = history[0], history[1:]
+    if not (
+        isinstance(lookback_item, dict)
+        and lookback_item.get("type") == "reasoning"
+        and isinstance(window[0], dict)
+    ):
+        return window
+    head = window[0]
+    starts_response_output = head.get("type") == "function_call" or (
+        head.get("type") == "message" and head.get("role") == "assistant"
+    )
+    return history if starts_response_output else window
+
+
 async def prepare_input_with_session(
     input: str | list[TResponseInputItem],
     session: Session | None,
@@ -457,10 +484,11 @@ async def prepare_input_with_session(
     if resolved_settings.limit is not None:
         history = await _session_get_items(
             session,
-            limit=resolved_settings.limit,
+            limit=resolved_settings.limit + 1,
             wrapper=wrapper,
             capture_compaction_generation=True,
         )
+        history = _align_limited_history_window(history, resolved_settings.limit)
     else:
         history = await _session_get_items(
             session,
