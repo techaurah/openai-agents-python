@@ -3444,6 +3444,164 @@ async def test_prepare_input_with_session_drops_limited_orphan_history_function_
     assert session_items == [{"role": "user", "content": "hello"}]
 
 
+def _reasoning_and_message_history() -> list[TResponseInputItem]:
+    return [
+        cast(TResponseInputItem, {"role": "user", "content": "first question"}),
+        cast(
+            TResponseInputItem,
+            {"type": "reasoning", "id": "rs_123", "summary": []},
+        ),
+        cast(
+            TResponseInputItem,
+            {
+                "type": "message",
+                "id": "msg_123",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "answer"}],
+            },
+        ),
+        cast(TResponseInputItem, {"role": "user", "content": "second question"}),
+    ]
+
+
+def _item_kinds(items: Any) -> list[str]:
+    return [item.get("type", item.get("role")) for item in items if isinstance(item, dict)]
+
+
+@pytest.mark.asyncio
+async def test_prepare_input_with_session_limit_keeps_reasoning_with_its_message():
+    session = SimpleListSession(history=_reasoning_and_message_history())
+
+    prepared_input, _ = await prepare_input_with_session(
+        "hello",
+        session,
+        None,
+        SessionSettings(limit=2),
+    )
+
+    # The limit window would start with the assistant message; its reasoning item must be
+    # kept, or the Responses API rejects the message for missing the reasoning item.
+    assert _item_kinds(prepared_input) == ["reasoning", "message", "user", "user"]
+    prepared = cast(list[dict[str, Any]], prepared_input)
+    assert prepared[0]["id"] == "rs_123"
+    assert prepared[1]["id"] == "msg_123"
+
+
+@pytest.mark.asyncio
+async def test_prepare_input_with_session_limit_alignment_with_omit_id_policy():
+    session = SimpleListSession(history=_reasoning_and_message_history())
+
+    prepared_input, _ = await prepare_input_with_session(
+        "hello",
+        session,
+        None,
+        SessionSettings(limit=2),
+        reasoning_item_id_policy="omit",
+    )
+
+    # Alignment keys off item types, never the reasoning item's own ID, so the repair still
+    # applies when reasoning IDs are omitted.
+    assert _item_kinds(prepared_input) == ["reasoning", "message", "user", "user"]
+    prepared = cast(list[dict[str, Any]], prepared_input)
+    assert "id" not in prepared[0]
+    assert prepared[1]["id"] == "msg_123"
+
+
+@pytest.mark.asyncio
+async def test_prepare_input_with_session_limit_aligned_window_unchanged():
+    session = SimpleListSession(history=_reasoning_and_message_history())
+
+    prepared_input, _ = await prepare_input_with_session(
+        "hello",
+        session,
+        None,
+        SessionSettings(limit=3),
+    )
+
+    assert _item_kinds(prepared_input) == ["reasoning", "message", "user", "user"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_input_with_session_limit_keeps_function_call_pair():
+    history = _reasoning_and_message_history()
+    history[3:3] = [
+        cast(
+            TResponseInputItem,
+            {
+                "type": "function_call",
+                "id": "fc_123",
+                "call_id": "call_123",
+                "name": "lookup",
+                "arguments": "{}",
+            },
+        ),
+        cast(
+            TResponseInputItem,
+            {"type": "function_call_output", "call_id": "call_123", "output": "ok"},
+        ),
+    ]
+    session = SimpleListSession(history=history)
+
+    prepared_input, _ = await prepare_input_with_session(
+        "hello",
+        session,
+        None,
+        SessionSettings(limit=3),
+    )
+
+    assert _item_kinds(prepared_input) == [
+        "function_call",
+        "function_call_output",
+        "user",
+        "user",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_input_with_session_limit_keeps_reasoning_with_its_function_call():
+    history: list[TResponseInputItem] = [
+        cast(TResponseInputItem, {"role": "user", "content": "first question"}),
+        cast(
+            TResponseInputItem,
+            {"type": "reasoning", "id": "rs_123", "summary": []},
+        ),
+        cast(
+            TResponseInputItem,
+            {
+                "type": "function_call",
+                "id": "fc_123",
+                "call_id": "call_123",
+                "name": "lookup",
+                "arguments": "{}",
+            },
+        ),
+        cast(
+            TResponseInputItem,
+            {"type": "function_call_output", "call_id": "call_123", "output": "ok"},
+        ),
+        cast(TResponseInputItem, {"role": "user", "content": "second question"}),
+    ]
+    session = SimpleListSession(history=history)
+
+    prepared_input, _ = await prepare_input_with_session(
+        "hello",
+        session,
+        None,
+        SessionSettings(limit=3),
+    )
+
+    # The window would start with the function call; its reasoning item must be kept and
+    # the call/output pair must stay intact.
+    assert _item_kinds(prepared_input) == [
+        "reasoning",
+        "function_call",
+        "function_call_output",
+        "user",
+        "user",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_prepare_input_with_session_preserves_new_function_call_outputs():
     new_output = cast(
