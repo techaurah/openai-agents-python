@@ -23,7 +23,11 @@ from agents import (
 )
 from agents.guardrail import input_guardrail, output_guardrail
 from agents.result import RunResultStreaming
-from agents.run_internal.guardrails import run_input_guardrails, run_input_guardrails_with_queue
+from agents.run_internal.guardrails import (
+    run_input_guardrails,
+    run_input_guardrails_with_queue,
+    run_output_guardrails,
+)
 from agents.testing import ScriptedModel
 
 from .test_responses import get_function_tool_call, get_text_message
@@ -2268,3 +2272,124 @@ async def test_output_guardrail_exception_reports_completed_results_streamed():
             pass
 
     assert _result_names(result.output_guardrail_results) == ["passes"]
+
+
+def _sibling_completing_as_completed():
+    """Wrap asyncio.as_completed so a tripwire result is delivered only after its siblings settle.
+
+    This deterministically reproduces a sibling guardrail that finished before the tripwire
+    was handled but whose result the completion loop had not consumed yet.
+    """
+    real_as_completed = asyncio.as_completed
+
+    def completing_as_completed(tasks, timeout=None):
+        async def deliver(awaitable):
+            result = await awaitable
+            if result.output.tripwire_triggered:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            return result
+
+        return [deliver(awaitable) for awaitable in real_as_completed(tasks)]
+
+    return completing_as_completed
+
+
+@pytest.mark.asyncio
+async def test_input_guardrail_tripwire_reports_already_completed_sibling() -> None:
+    sibling_release = asyncio.Event()
+
+    async def passing_guardrail(
+        context: RunContextWrapper[Any], agent: Agent[Any], input: str | list[TResponseInputItem]
+    ):
+        await sibling_release.wait()
+        return GuardrailFunctionOutput(output_info="passes", tripwire_triggered=False)
+
+    async def tripping_guardrail(
+        context: RunContextWrapper[Any], agent: Agent[Any], input: str | list[TResponseInputItem]
+    ):
+        sibling_release.set()
+        return GuardrailFunctionOutput(output_info="trips", tripwire_triggered=True)
+
+    guardrails = [
+        InputGuardrail(guardrail_function=tripping_guardrail),
+        InputGuardrail(guardrail_function=passing_guardrail),
+    ]
+    sink: list[Any] = []
+    with patch.object(asyncio, "as_completed", _sibling_completing_as_completed()):
+        with pytest.raises(InputGuardrailTripwireTriggered):
+            await run_input_guardrails(
+                agent=Agent(name="test"),
+                guardrails=guardrails,
+                input="test",
+                context=RunContextWrapper(context=None),
+                results_sink=sink,
+            )
+
+    assert sorted(result.output.output_info for result in sink) == ["passes", "trips"]
+
+
+@pytest.mark.asyncio
+async def test_output_guardrail_tripwire_reports_already_completed_sibling() -> None:
+    sibling_release = asyncio.Event()
+
+    async def passing_guardrail(
+        context: RunContextWrapper[Any], agent: Agent[Any], agent_output: Any
+    ):
+        await sibling_release.wait()
+        return GuardrailFunctionOutput(output_info="passes", tripwire_triggered=False)
+
+    async def tripping_guardrail(
+        context: RunContextWrapper[Any], agent: Agent[Any], agent_output: Any
+    ):
+        sibling_release.set()
+        return GuardrailFunctionOutput(output_info="trips", tripwire_triggered=True)
+
+    guardrails = [
+        OutputGuardrail(guardrail_function=tripping_guardrail),
+        OutputGuardrail(guardrail_function=passing_guardrail),
+    ]
+    sink: list[Any] = []
+    with patch.object(asyncio, "as_completed", _sibling_completing_as_completed()):
+        with pytest.raises(OutputGuardrailTripwireTriggered):
+            await run_output_guardrails(
+                guardrails=guardrails,
+                agent=Agent(name="test"),
+                agent_output="test",
+                context=RunContextWrapper(context=None),
+                results_sink=sink,
+            )
+
+    assert sorted(result.output.output_info for result in sink) == ["passes", "trips"]
+
+
+@pytest.mark.asyncio
+async def test_input_guardrail_tripwire_does_not_report_unfinished_sibling() -> None:
+    async def passing_guardrail(
+        context: RunContextWrapper[Any], agent: Agent[Any], input: str | list[TResponseInputItem]
+    ):
+        await asyncio.sleep(30)
+        return GuardrailFunctionOutput(output_info="passes", tripwire_triggered=False)
+
+    async def tripping_guardrail(
+        context: RunContextWrapper[Any], agent: Agent[Any], input: str | list[TResponseInputItem]
+    ):
+        return GuardrailFunctionOutput(output_info="trips", tripwire_triggered=True)
+
+    guardrails = [
+        InputGuardrail(guardrail_function=tripping_guardrail),
+        InputGuardrail(guardrail_function=passing_guardrail),
+    ]
+    sink: list[Any] = []
+    with pytest.raises(InputGuardrailTripwireTriggered):
+        await asyncio.wait_for(
+            run_input_guardrails(
+                agent=Agent(name="test"),
+                guardrails=guardrails,
+                input="test",
+                context=RunContextWrapper(context=None),
+                results_sink=sink,
+            ),
+            timeout=10,
+        )
+
+    assert [result.output.output_info for result in sink] == ["trips"]
