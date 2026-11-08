@@ -139,7 +139,15 @@ class ToolContext(RunContextWrapper[TContext]):
         to_state = getattr(pending_result, "to_state", None)
         if not isinstance(interruptions, list) or not callable(to_state):
             return None
-        nested_context = getattr(to_state(), "_context", None)
+        # Prefer the pending result's live context: RunResult.to_state() builds an
+        # independent checkpoint each time (its context deep-copies _approvals), so a
+        # decision recorded on to_state()._context would land in a temporary copy
+        # that nothing keeps. Recording on the live context lets the next checkpoint
+        # carry the decision. Resume checkpoints return their stored state from
+        # to_state(), so they fall back to that path below.
+        nested_context = getattr(pending_result, "context_wrapper", None)
+        if not isinstance(nested_context, RunContextWrapper):
+            nested_context = getattr(to_state(), "_context", None)
         if not isinstance(nested_context, RunContextWrapper) or nested_context is self:
             return None
 
