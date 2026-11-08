@@ -1561,6 +1561,28 @@ class RunState(Generic[TContext, TAgent]):
                     content = normalized_item.get("content")
                     if isinstance(content, str):
                         normalized_item["content"] = [{"type": "output_text", "text": content}]
+                    elif isinstance(content, list):
+                        normalized_item["content"] = [
+                            {**part, "type": "output_text"}
+                            if isinstance(part, dict)
+                            and part.get("type") == "input_text"
+                            and isinstance(part.get("text"), str)
+                            else part
+                            for part in content
+                        ]
+                    content = normalized_item.get("content")
+                    if (
+                        isinstance(content, list)
+                        and len(content) > 0
+                        and all(
+                            isinstance(part, dict)
+                            and part.get("type") in ("output_text", "refusal")
+                            for part in content
+                        )
+                    ):
+                        # Emit a genuine Responses output message so the item
+                        # converts on every model path, including Chat Completions.
+                        normalized_item["type"] = "message"
                     if "status" not in normalized_item:
                         normalized_item["status"] = "completed"
             normalized_items.append(normalized_item)
