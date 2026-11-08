@@ -355,9 +355,17 @@ class Converter:
         # Session replay strips storage IDs from assistant output messages.
         if (
             isinstance(item, dict)
-            and item.get("type") == "message"
             and item.get("role") == "assistant"
             and "content" in item
+            and (
+                item.get("type") == "message"
+                or (
+                    # Checkpoints serialized before RunState tagged assistant history
+                    # with type "message" carry the same output-text content with a
+                    # status and no type; accept that legacy shape too.
+                    "type" not in item and item.get("status") == "completed"
+                )
+            )
             and (
                 "id" in item
                 or (
