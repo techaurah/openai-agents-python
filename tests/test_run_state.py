@@ -15,7 +15,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, Literal, TypeVar, cast
 
+import httpx
 import pytest
+from openai import AsyncOpenAI
 from openai.types.responses import (
     ResponseCustomToolCall,
     ResponseFunctionShellToolCall,
@@ -43,7 +45,7 @@ from openai.types.responses.response_usage import InputTokensDetails
 from openai.types.responses.tool_param import Mcp
 from pydantic import BaseModel, ValidationError, model_serializer
 
-from agents import Agent, RunConfig, RunHooks, Runner, handoff, trace
+from agents import Agent, OpenAIChatCompletionsModel, RunConfig, RunHooks, Runner, handoff, trace
 from agents._tool_invocation import tool_invocation_identity_and_scope
 from agents.computer import Computer
 from agents.exceptions import ModelBehaviorError, UserError
@@ -4472,10 +4474,93 @@ class TestSerializationRoundTrip:
 
         assistant_msg = json_data["original_input"][0]
         assert assistant_msg["role"] == "assistant"
+        assert assistant_msg["type"] == "message"
         assert assistant_msg["status"] == expected_status
         assert isinstance(assistant_msg["content"], list)
         assert assistant_msg["content"][0]["type"] == "output_text"
         assert assistant_msg["content"][0]["text"] == expected_text
+
+    @pytest.mark.allow_call_model_methods
+    @pytest.mark.asyncio
+    async def test_restored_assistant_history_resumes_on_chat_completions_model(self):
+        """A string round trip must not break assistant history on Chat Completions.
+
+        Regression test for #5592: RunState._serialize_input rewrote assistant
+        input items into output-text content with a status but no type, which
+        the Chat Completions converter rejected. The restored state must resume
+        like the in-memory one.
+        """
+
+        @function_tool(needs_approval=True)
+        def record_receipt(reference: str) -> str:
+            """Record a receipt."""
+            return "Recorded."
+
+        history = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello! How can I help?"},
+            {"role": "user", "content": "Record receipt RCV-682."},
+        ]
+
+        async def run_once(persist: bool) -> str:
+            replies = iter(
+                [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "record_receipt",
+                                    "arguments": '{"reference": "RCV-682"}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "assistant", "content": "Done."},
+                ]
+            )
+
+            def respond(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "gpt-4.1",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "finish_reason": "stop",
+                                "message": next(replies),
+                            }
+                        ],
+                    },
+                )
+
+            client = AsyncOpenAI(
+                api_key="test",
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+            )
+            agent = Agent(
+                name="Assistant",
+                tools=[record_receipt],
+                model=OpenAIChatCompletionsModel("gpt-4.1", client),
+            )
+            run_config = RunConfig(tracing_disabled=True)
+            paused = await Runner.run(agent, history, run_config=run_config)
+            state = paused.to_state()
+            if persist:
+                state = await RunState.from_string(agent, state.to_string())
+            state.approve(state.get_interruptions()[0])
+            result = await Runner.run(agent, state, run_config=run_config)
+            return str(result.final_output)
+
+        assert await run_once(persist=False) == "Done."
+        assert await run_once(persist=True) == "Done."
 
     async def test_from_string_normalizes_original_input_dict_items(self):
         """Test that from_string normalizes original input dict items.
