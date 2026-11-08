@@ -248,6 +248,34 @@ def test_items_to_messages_with_easy_input_message():
 
 
 @pytest.mark.parametrize(
+    "item",
+    [
+        # The shape RunState._serialize_input emits for assistant history.
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Hello! How can I help?"}],
+            "status": "completed",
+        },
+        # The same shape as serialized before it carried a type: checkpoints
+        # persisted by earlier versions must still restore.
+        {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Hello! How can I help?"}],
+            "status": "completed",
+        },
+    ],
+    ids=["serialized_assistant_message", "legacy_serialized_assistant_message"],
+)
+def test_items_to_messages_accepts_serialized_assistant_history(item: dict[str, Any]):
+    """Serialized assistant history must convert to an assistant message."""
+    messages = Converter.items_to_messages([cast(TResponseInputItem, item)])
+    assert len(messages) == 1
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] == "Hello! How can I help?"
+
+
+@pytest.mark.parametrize(
     "content",
     [
         "hello",
