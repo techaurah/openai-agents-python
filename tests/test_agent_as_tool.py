@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import json
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -41,6 +43,7 @@ from agents._run_state_agent_identity import _build_agent_map
 from agents._tool_identity import resolve_tool_name_collisions
 from agents.agent_tool_input import StructuredToolInputBuilderOptions
 from agents.agent_tool_state import (
+    drop_agent_tool_run_result,
     get_agent_tool_state_scope,
     record_agent_tool_resume_state,
     record_agent_tool_run_result,
@@ -1860,6 +1863,73 @@ def test_agent_as_tool_tool_context_ambiguous_approval_identity_fails_closed(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("approve", [True, False], ids=["approve", "reject"])
+def test_agent_as_tool_tool_context_routes_nested_approval_to_live_context(
+    approve: bool,
+) -> None:
+    """ToolContext decisions must reach the nested run when to_state() copies state.
+
+    Regression test for #5593: a real RunResult.to_state() builds an independent
+    checkpoint on every call, so recording the decision on to_state()._context
+    drops it. The decision must land on the pending result's live context, from
+    which the next checkpoint copies it.
+    """
+    agent = Agent(name="Agent")
+    outer_call = make_function_tool_call("nested_agent_tool", call_id="outer-nested-copy")
+    nested_call = make_function_tool_call("sensitive", call_id="inner-copy")
+    nested_approval = ToolApprovalItem(agent=agent, raw_item=nested_call)
+    tool_context = ToolContext(
+        context=None,
+        tool_name=outer_call.name,
+        tool_call_id=outer_call.call_id,
+        tool_arguments=outer_call.arguments,
+        tool_call=outer_call,
+    )
+    nested_context = ToolContext(
+        context=None,
+        tool_name=outer_call.name,
+        tool_call_id=outer_call.call_id,
+        tool_arguments=outer_call.arguments,
+        tool_call=outer_call,
+    )
+    nested_context._tool_invocation_status(nested_call)  # noqa: SLF001
+
+    class CopyingPendingResult:
+        """Mimic RunResult.to_state(): a fresh independent checkpoint per call."""
+
+        interruptions = [nested_approval]
+        context_wrapper = nested_context
+
+        def to_state(self) -> SimpleNamespace:
+            copied_context = copy.copy(nested_context)
+            copied_context._approvals = copy.deepcopy(nested_context._approvals)  # noqa: SLF001
+            return SimpleNamespace(_context=copied_context)
+
+    pending = CopyingPendingResult()
+    record_agent_tool_run_result(
+        outer_call,
+        cast(Any, pending),
+        scope_id=get_agent_tool_state_scope(tool_context),
+    )
+
+    try:
+        if approve:
+            tool_context.approve_tool(nested_approval)
+        else:
+            tool_context.reject_tool(nested_approval)
+
+        assert nested_context.is_tool_approved("sensitive", "inner-copy") is approve
+        # A checkpoint built after the decision must carry it, as the resume
+        # checkpoint built by RunResult.to_state() would.
+        checkpoint_context = pending.to_state()._context
+        assert checkpoint_context.is_tool_approved("sensitive", "inner-copy") is approve
+    finally:
+        drop_agent_tool_run_result(
+            outer_call,
+            scope_id=get_agent_tool_state_scope(tool_context),
+        )
 
 
 @pytest.mark.parametrize("streamed", [False, True], ids=["non_streamed", "streamed"])
